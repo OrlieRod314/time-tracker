@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# timetrack — TUI time tracker with seamless charge code switching
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/time-tracker"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/time-tracker"
+CODES_FILE="$CONFIG_DIR/codes"
+SETTINGS_FILE="$CONFIG_DIR/settings"
+
+mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+[[ -f "$CODES_FILE" ]]    || touch "$CODES_FILE"
+[[ -f "$SETTINGS_FILE" ]] || touch "$SETTINGS_FILE"
+
+TODAY=$(date +%Y-%m-%d)
+LOG_FILE="$DATA_DIR/$TODAY.csv"
+STATE_FILE="$DATA_DIR/state"   # persists the active session across crashes
+
+[[ -f "$LOG_FILE" ]] || printf 'timestamp,code,description,seconds\n' > "$LOG_FILE"
+
+if command -v whiptail &>/dev/null; then
+    DIALOG=whiptail
+elif command -v dialog &>/dev/null; then
+    DIALOG=dialog
+else
+    printf 'Error: whiptail or dialog is required.\n  sudo apt install whiptail\n' >&2
+    exit 1
+fi
+
+# ── global tracking state ──────────────────────────────────────────────────
+ACTIVE_CODE=''
+ACTIVE_DESC=''
+ACTIVE_START=0   # epoch seconds; 0 means nothing is running
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+fmt_dur() {
+    local s=$1
+    printf '%02d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60))
+}
+
+fmt_dec() {
+    # Tenths of an hour, rounded (e.g. 3600s → "1.0", 5580s → "1.6")
+    local s=$1
+    local tenths=$(( (s + 180) / 360 ))
+    printf '%d.%d' $(( tenths / 10 )) $(( tenths % 10 ))
+}
+
+get_setting() {
+    grep -m1 "^${1}=" "$SETTINGS_FILE" 2>/dev/null | cut -d= -f2-
+}
+
+set_setting() {
+    local key=$1 val=$2
+    local rest
+    rest=$(grep -v "^${key}=" "$SETTINGS_FILE" 2>/dev/null || true)
+    { [[ -n "$rest" ]] && printf '%s\n' "$rest"; printf '%s=%s\n' "$key" "$val"; } \
+        > "$SETTINGS_FILE"
+}
+
+load_codes() {
+    mapfile -t CODES < "$CODES_FILE" 2>/dev/null || CODES=()
+    local f=()
+    for c in "${CODES[@]+"${CODES[@]}"}"; do [[ -n "$c" ]] && f+=("$c"); done
+    CODES=("${f[@]+"${f[@]}"}")
+}
+
+save_codes() {
+    printf '%s\n' "${CODES[@]+"${CODES[@]}"}" > "$CODES_FILE"
+}
+
+load_today_totals() {
+    declare -gA TOTALS=()
+    [[ -f "$LOG_FILE" ]] || return
+    local ts code desc secs
+    while IFS=, read -r ts code desc secs; do
+        [[ "$ts" == "timestamp" ]] && continue
+        TOTALS["$code"]=$(( ${TOTALS["$code"]:-0} + secs ))
+    done < "$LOG_FILE"
+}
+
+log_entry() {
+    local code=$1 desc=$2 secs=$3
+    [[ $secs -le 0 ]] && return
+    printf '%s,%s,%s,%s\n' "$(date +%H:%M:%S)" "$code" "$desc" "$secs" \
+        >> "$LOG_FILE"
+}
+
+# ── state file (crash recovery) ───────────────────────────────────────────
+
+save_state() {
+    printf 'code=%s\ndesc=%s\nstart=%s\n' \
+        "$ACTIVE_CODE" "$ACTIVE_DESC" "$ACTIVE_START" > "$STATE_FILE"
+}
+
+clear_state() {
+    rm -f "$STATE_FILE"
+}
+
+# On startup: if the state file exists, either resume (same day) or log the
+# orphaned session to the correct day's file (previous day / crash).
+restore_state() {
+    [[ -f "$STATE_FILE" ]] || return
+    local code desc start
+    code=$(grep  '^code='  "$STATE_FILE" | cut -d= -f2-)
+    desc=$(grep  '^desc='  "$STATE_FILE" | cut -d= -f2-)
+    start=$(grep '^start=' "$STATE_FILE" | cut -d= -f2-)
+    rm -f "$STATE_FILE"
+
+    [[ -z "$code" || -z "$start" ]] && return
+    local now; now=$(date +%s)
+    [[ $start -le 0 || $start -gt $now ]] && return   # corrupted
+
+    local start_date
+    start_date=$(date -d "@$start" +%Y-%m-%d 2>/dev/null \
+              || date -r  "$start" +%Y-%m-%d 2>/dev/null) || return
+
+    if [[ "$start_date" == "$TODAY" ]]; then
+        ACTIVE_CODE=$code
+        ACTIVE_DESC=$desc
+        ACTIVE_START=$start
+        save_state   # re-arm for the resumed session
+    else
+        # Orphaned session from a previous day — append to that day's log
+        local old_log="$DATA_DIR/$start_date.csv"
+        [[ -f "$old_log" ]] || printf 'timestamp,code,description,seconds\n' > "$old_log"
+        printf '%s,%s,%s,%s\n' \
+            "$(date +%H:%M:%S)" "$code" "$desc" "$(( now - start ))" >> "$old_log"
+    fi
+}
+
+# ── session control ────────────────────────────────────────────────────────
+
+stop_active() {
+    [[ -z "$ACTIVE_CODE" || $ACTIVE_START -eq 0 ]] && return
+    log_entry "$ACTIVE_CODE" "$ACTIVE_DESC" "$(( $(date +%s) - ACTIVE_START ))"
+    clear_state
+    ACTIVE_CODE='' ACTIVE_DESC='' ACTIVE_START=0
+}
+
+switch_to() {
+    stop_active
+    ACTIVE_CODE=$1
+    ACTIVE_DESC=$2
+    ACTIVE_START=$(date +%s)
+    save_state
+}
+
+# ── screen drawing ─────────────────────────────────────────────────────────
+
+draw_screen() {
+    local now=$(date +%s)
+    local session_elapsed=0
+    [[ $ACTIVE_START -gt 0 ]] && session_elapsed=$(( now - ACTIVE_START ))
+
+    load_today_totals
+    load_codes
+
+    # Merge completed sessions + live session for display
+    declare -A DISP=()
+    for k in "${!TOTALS[@]}"; do DISP["$k"]=${TOTALS[$k]}; done
+    if [[ -n "$ACTIVE_CODE" ]]; then
+        DISP["$ACTIVE_CODE"]=$(( ${DISP["$ACTIVE_CODE"]:-0} + session_elapsed ))
+    fi
+
+    local W=50
+    _sep() { printf '%*s\n' "$W" '' | tr ' ' '-'; }
+
+    tput cup 0 0
+
+    # ── header ───────────────────────────────────────────────────────────────
+    local datestr; datestr=$(date '+%a %Y-%m-%d')
+    printf 'TIME TRACKER  %s\n' "$datestr"
+    _sep
+
+    # ── active code ───────────────────────────────────────────────────────────
+    if [[ -n "$ACTIVE_CODE" ]]; then
+        local today_total=${DISP["$ACTIVE_CODE"]:-0}
+        printf '> %s -- %s\n' "$ACTIVE_CODE" "$ACTIVE_DESC"
+        printf '  session %s   today %s  %s\n' \
+            "$(fmt_dur $session_elapsed)" "$(fmt_dec $today_total)" "$(fmt_dur $today_total)"
+    else
+        printf '> (none)  --  press [s] to pick a code\n'
+        printf '\n'
+    fi
+    _sep
+
+    # ── today's log ───────────────────────────────────────────────────────────
+    printf 'TODAY\n\n'
+
+    local grand=0
+    if [[ ${#CODES[@]} -eq 0 ]]; then
+        printf '  no charge codes yet -- press [m] to add some\n'
+    else
+        local i=1
+        for entry in "${CODES[@]}"; do
+            local code="${entry%%:*}"
+            local desc="${entry#*:}"
+            local secs=${DISP["$code"]:-0}
+            grand=$(( grand + secs ))
+            local mark=' '
+            [[ "$code" == "$ACTIVE_CODE" ]] && mark='>'
+            local num_lbl
+            [[ $i -le 9 ]] && num_lbl="[$i]" || num_lbl='   '
+            printf '%s %s %s  %s  %s  %s\n' \
+                "$num_lbl" "$mark" "$(fmt_dec $secs)" "$(fmt_dur $secs)" "$code" "$desc"
+            (( i++ )) || true
+        done
+        printf '\n'
+        printf '        %s  %s  TOTAL\n' "$(fmt_dec $grand)" "$(fmt_dur $grand)"
+    fi
+    _sep
+
+    # ── key legend ────────────────────────────────────────────────────────────
+    printf '[1-9]  [s]elect  [d]efault  [m]anage  [q]uit\n'
+
+    tput ed 2>/dev/null || true
+}
+
+# ── pickers / forms (whiptail) ─────────────────────────────────────────────
+
+pick_code() {
+    load_codes
+    if [[ ${#CODES[@]} -eq 0 ]]; then
+        "$DIALOG" --msgbox 'No charge codes. Add some via [m].' 7 46
+        return 1
+    fi
+    load_today_totals
+    local now=$(date +%s)
+    local items=()
+    for entry in "${CODES[@]}"; do
+        local c="${entry%%:*}" d="${entry#*:}"
+        local s=${TOTALS["$c"]:-0}
+        [[ "$c" == "$ACTIVE_CODE" && $ACTIVE_START -gt 0 ]] && \
+            s=$(( s + now - ACTIVE_START ))
+        items+=("$c" "$d  [$(fmt_dur $s)]")
+    done
+    local sel
+    sel=$("$DIALOG" --title 'Switch Code' \
+        --menu 'Select charge code to track:' 20 64 12 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return 1
+    local d=''
+    for entry in "${CODES[@]}"; do
+        [[ "${entry%%:*}" == "$sel" ]] && d="${entry#*:}" && break
+    done
+    switch_to "$sel" "$d"
+}
+
+do_add_code() {
+    local code desc
+    code=$("$DIALOG" --title 'Add Charge Code' \
+        --inputbox 'Charge code (e.g. PROJ-001):' 8 52 '' \
+        3>&1 1>&2 2>&3) || return
+    code=$(printf '%s' "$code" | tr -d ',\n' | xargs 2>/dev/null || true)
+    [[ -z "$code" ]] && return
+
+    load_codes
+    for e in "${CODES[@]+"${CODES[@]}"}"; do
+        if [[ "${e%%:*}" == "$code" ]]; then
+            "$DIALOG" --msgbox "Code '$code' already exists." 7 42
+            return
+        fi
+    done
+
+    desc=$("$DIALOG" --title 'Add Charge Code' \
+        --inputbox "Description for $code:" 8 52 '' \
+        3>&1 1>&2 2>&3) || return
+    desc=$(printf '%s' "$desc" | tr -d ',\n' | xargs 2>/dev/null || true)
+    [[ -z "$desc" ]] && desc="$code"
+
+    CODES+=("$code:$desc")
+    save_codes
+}
+
+do_delete_code() {
+    load_codes
+    if [[ ${#CODES[@]} -eq 0 ]]; then
+        "$DIALOG" --msgbox 'No codes to delete.' 7 40
+        return
+    fi
+    local items=()
+    for e in "${CODES[@]}"; do items+=("${e%%:*}" "${e#*:}"); done
+    local sel
+    sel=$("$DIALOG" --title 'Delete Charge Code' \
+        --menu 'Select code to remove:' 20 62 12 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return
+    "$DIALOG" --yesno "Delete '$sel'?" 7 42 || return
+
+    local def; def=$(get_setting default_code)
+    [[ "$def" == "$sel" ]] && set_setting default_code ''
+    [[ "$ACTIVE_CODE" == "$sel" ]] && stop_active
+
+    local new=()
+    for e in "${CODES[@]}"; do [[ "${e%%:*}" != "$sel" ]] && new+=("$e"); done
+    CODES=("${new[@]+"${new[@]}"}")
+    save_codes
+}
+
+do_set_default() {
+    load_codes
+    if [[ ${#CODES[@]} -eq 0 ]]; then
+        "$DIALOG" --msgbox 'No codes configured.' 7 40
+        return
+    fi
+    local cur; cur=$(get_setting default_code)
+    local items=('(none)' 'Do not auto-start on launch')
+    for e in "${CODES[@]}"; do items+=("${e%%:*}" "${e#*:}"); done
+    local sel
+    sel=$("$DIALOG" --title 'Default Startup Code' \
+        --menu "Auto-start on launch  (current: ${cur:-(none)})" 20 64 12 \
+        "${items[@]}" 3>&1 1>&2 2>&3) || return
+    if [[ "$sel" == '(none)' ]]; then
+        set_setting default_code ''
+    else
+        set_setting default_code "$sel"
+    fi
+}
+
+manage_codes() {
+    while true; do
+        local choice
+        choice=$("$DIALOG" --title 'Manage Charge Codes' \
+            --menu 'Choose:' 14 54 4 \
+            add     'Add a charge code' \
+            delete  'Delete a charge code' \
+            default 'Set default startup code' \
+            back    'Back' \
+            3>&1 1>&2 2>&3) || break
+        case "$choice" in
+            add)     do_add_code ;;
+            delete)  do_delete_code ;;
+            default) do_set_default ;;
+            back)    break ;;
+        esac
+    done
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+main() {
+    local cleanup_done=false
+    cleanup() {
+        $cleanup_done && return
+        cleanup_done=true
+        stop_active
+        tput cnorm
+        tput rmcup 2>/dev/null || clear
+    }
+    trap cleanup EXIT INT TERM
+
+    tput smcup
+    tput civis
+    clear
+
+    # Resume a session that was running when the program last died uncleanly
+    restore_state
+
+    # Auto-start the default code only if no session was restored
+    if [[ -z "$ACTIVE_CODE" ]]; then
+        load_codes
+        local def; def=$(get_setting default_code)
+        if [[ -n "$def" ]]; then
+            for entry in "${CODES[@]+"${CODES[@]}"}"; do
+                if [[ "${entry%%:*}" == "$def" ]]; then
+                    switch_to "$def" "${entry#*:}"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    local key
+    while true; do
+        draw_screen
+        key=''
+        IFS= read -r -s -n1 -t1 key 2>/dev/null && {
+            case "$key" in
+                q|Q)
+                    break
+                    ;;
+                s|S)
+                    tput cnorm
+                    pick_code
+                    tput civis
+                    ;;
+                m|M)
+                    tput cnorm
+                    manage_codes
+                    tput civis
+                    ;;
+                d|D)
+                    tput cnorm
+                    do_set_default
+                    tput civis
+                    ;;
+                [1-9])
+                    load_codes
+                    local idx=$(( key - 1 ))
+                    if [[ $idx -lt ${#CODES[@]} ]]; then
+                        local entry="${CODES[$idx]}"
+                        switch_to "${entry%%:*}" "${entry#*:}"
+                    fi
+                    ;;
+            esac
+        } || true
+    done
+}
+
+main "$@"

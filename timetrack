@@ -16,15 +16,6 @@ STATE_FILE="$DATA_DIR/state"   # persists the active session across crashes
 
 [[ -f "$LOG_FILE" ]] || printf 'timestamp,code,description,seconds\n' > "$LOG_FILE"
 
-if command -v whiptail &>/dev/null; then
-    DIALOG=whiptail
-elif command -v dialog &>/dev/null; then
-    DIALOG=dialog
-else
-    printf 'Error: whiptail or dialog is required.\n  sudo apt install whiptail\n' >&2
-    exit 1
-fi
-
 # ── global tracking state ──────────────────────────────────────────────────
 ACTIVE_CODE=''
 ACTIVE_DESC=''
@@ -84,7 +75,7 @@ log_entry() {
         >> "$LOG_FILE"
 }
 
-# ── state file (crash recovery) ───────────────────────────────────────────
+# ── state file (crash recovery) ────────────────────────────────────────────
 
 save_state() {
     printf 'code=%s\ndesc=%s\nstart=%s\n' \
@@ -144,6 +135,72 @@ switch_to() {
     save_state
 }
 
+# ── pure bash TUI primitives ───────────────────────────────────────────────
+
+# Arrow-key menu. Displays items with a > cursor, Enter to select, q/Esc to
+# cancel. Sets REPLY to the selected index; returns 1 on cancel.
+_menu() {
+    local prompt=$1; shift
+    local items=("$@")
+    local n=${#items[@]} sel=0 key seq
+
+    tput cnorm
+    while true; do
+        clear
+        printf '%s\n\n' "$prompt"
+        for (( i=0; i<n; i++ )); do
+            [[ $i -eq $sel ]] \
+                && printf ' > %s\n' "${items[$i]}" \
+                || printf '   %s\n' "${items[$i]}"
+        done
+        printf '\n  arrows / Enter / q\n'
+
+        IFS= read -r -s -n1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -r -s -n2 -t0.1 seq || seq=''
+            case "$seq" in
+                '[A') (( sel > 0   )) && (( sel-- )) || true ;;
+                '[B') (( sel < n-1 )) && (( sel++ )) || true ;;
+                *)    tput civis; return 1 ;;
+            esac
+        else
+            case "$key" in
+                ''|$'\n') tput civis; REPLY=$sel; return 0 ;;
+                q|Q)      tput civis; return 1 ;;
+            esac
+        fi
+    done
+}
+
+# Read a line of text into REPLY. Returns 1 on Ctrl-D.
+_input() {
+    clear
+    printf '%s\n> ' "$1"
+    tput cnorm
+    IFS= read -r REPLY || { tput civis; return 1; }
+    tput civis
+}
+
+# Single-keystroke yes/no. Returns 0 for y/Y, 1 otherwise.
+_confirm() {
+    clear
+    printf '%s [y/N] ' "$1"
+    tput cnorm
+    IFS= read -r -n1 REPLY
+    printf '\n'
+    tput civis
+    [[ "${REPLY,,}" == 'y' ]]
+}
+
+# Print a message and wait for Enter.
+_msg() {
+    clear
+    printf '%s\n\npress Enter...' "$1"
+    tput cnorm
+    IFS= read -r _
+    tput civis
+}
+
 # ── screen drawing ─────────────────────────────────────────────────────────
 
 draw_screen() {
@@ -166,7 +223,7 @@ draw_screen() {
 
     tput cup 0 0
 
-    # ── header ───────────────────────────────────────────────────────────────
+    # ── header ────────────────────────────────────────────────────────────────
     local datestr; datestr=$(date '+%a %Y-%m-%d')
     printf 'TIME TRACKER  %s\n' "$datestr"
     _sep
@@ -215,55 +272,46 @@ draw_screen() {
     tput ed 2>/dev/null || true
 }
 
-# ── pickers / forms (whiptail) ─────────────────────────────────────────────
+# ── pickers / forms ────────────────────────────────────────────────────────
 
 pick_code() {
     load_codes
     if [[ ${#CODES[@]} -eq 0 ]]; then
-        "$DIALOG" --msgbox 'No charge codes. Add some via [m].' 7 46
+        _msg 'no charge codes configured. add some with [m].'
         return 1
     fi
     load_today_totals
-    local now=$(date +%s)
-    local items=()
+    local now; now=$(date +%s)
+    local labels=()
     for entry in "${CODES[@]}"; do
         local c="${entry%%:*}" d="${entry#*:}"
         local s=${TOTALS["$c"]:-0}
         [[ "$c" == "$ACTIVE_CODE" && $ACTIVE_START -gt 0 ]] && \
             s=$(( s + now - ACTIVE_START ))
-        items+=("$c" "$d  [$(fmt_dur $s)]")
+        labels+=("$c  $d  [$(fmt_dur $s)]")
     done
-    local sel
-    sel=$("$DIALOG" --title 'Switch Code' \
-        --menu 'Select charge code to track:' 20 64 12 \
-        "${items[@]}" 3>&1 1>&2 2>&3) || return 1
-    local d=''
-    for entry in "${CODES[@]}"; do
-        [[ "${entry%%:*}" == "$sel" ]] && d="${entry#*:}" && break
-    done
-    switch_to "$sel" "$d"
+    _menu 'select charge code:' "${labels[@]}" || return 1
+    local entry="${CODES[$REPLY]}"
+    switch_to "${entry%%:*}" "${entry#*:}"
 }
 
 do_add_code() {
-    local code desc
-    code=$("$DIALOG" --title 'Add Charge Code' \
-        --inputbox 'Charge code (e.g. PROJ-001):' 8 52 '' \
-        3>&1 1>&2 2>&3) || return
-    code=$(printf '%s' "$code" | tr -d ',\n' | xargs 2>/dev/null || true)
+    _input 'charge code (e.g. PROJ-001):' || return
+    local code
+    code=$(printf '%s' "$REPLY" | tr -d ',\n' | xargs 2>/dev/null || true)
     [[ -z "$code" ]] && return
 
     load_codes
     for e in "${CODES[@]+"${CODES[@]}"}"; do
         if [[ "${e%%:*}" == "$code" ]]; then
-            "$DIALOG" --msgbox "Code '$code' already exists." 7 42
+            _msg "code '$code' already exists."
             return
         fi
     done
 
-    desc=$("$DIALOG" --title 'Add Charge Code' \
-        --inputbox "Description for $code:" 8 52 '' \
-        3>&1 1>&2 2>&3) || return
-    desc=$(printf '%s' "$desc" | tr -d ',\n' | xargs 2>/dev/null || true)
+    _input "description for $code:" || return
+    local desc
+    desc=$(printf '%s' "$REPLY" | tr -d ',\n' | xargs 2>/dev/null || true)
     [[ -z "$desc" ]] && desc="$code"
 
     CODES+=("$code:$desc")
@@ -272,63 +320,53 @@ do_add_code() {
 
 do_delete_code() {
     load_codes
-    if [[ ${#CODES[@]} -eq 0 ]]; then
-        "$DIALOG" --msgbox 'No codes to delete.' 7 40
-        return
-    fi
-    local items=()
-    for e in "${CODES[@]}"; do items+=("${e%%:*}" "${e#*:}"); done
-    local sel
-    sel=$("$DIALOG" --title 'Delete Charge Code' \
-        --menu 'Select code to remove:' 20 62 12 \
-        "${items[@]}" 3>&1 1>&2 2>&3) || return
-    "$DIALOG" --yesno "Delete '$sel'?" 7 42 || return
+    [[ ${#CODES[@]} -eq 0 ]] && _msg 'no codes to delete.' && return
+
+    local labels=()
+    for e in "${CODES[@]}"; do labels+=("${e%%:*}  ${e#*:}"); done
+    _menu 'delete which code?' "${labels[@]}" || return
+    local idx=$REPLY
+    local code="${CODES[$idx]%%:*}"
+
+    _confirm "delete '$code'?" || return
 
     local def; def=$(get_setting default_code)
-    [[ "$def" == "$sel" ]] && set_setting default_code ''
-    [[ "$ACTIVE_CODE" == "$sel" ]] && stop_active
+    [[ "$def" == "$code" ]] && set_setting default_code ''
+    [[ "$ACTIVE_CODE" == "$code" ]] && stop_active
 
     local new=()
-    for e in "${CODES[@]}"; do [[ "${e%%:*}" != "$sel" ]] && new+=("$e"); done
+    for e in "${CODES[@]}"; do [[ "${e%%:*}" != "$code" ]] && new+=("$e"); done
     CODES=("${new[@]+"${new[@]}"}")
     save_codes
 }
 
 do_set_default() {
     load_codes
-    if [[ ${#CODES[@]} -eq 0 ]]; then
-        "$DIALOG" --msgbox 'No codes configured.' 7 40
-        return
-    fi
+    [[ ${#CODES[@]} -eq 0 ]] && _msg 'no codes configured.' && return
+
     local cur; cur=$(get_setting default_code)
-    local items=('(none)' 'Do not auto-start on launch')
-    for e in "${CODES[@]}"; do items+=("${e%%:*}" "${e#*:}"); done
-    local sel
-    sel=$("$DIALOG" --title 'Default Startup Code' \
-        --menu "Auto-start on launch  (current: ${cur:-(none)})" 20 64 12 \
-        "${items[@]}" 3>&1 1>&2 2>&3) || return
-    if [[ "$sel" == '(none)' ]]; then
+    local labels=("(none)  don't auto-start on launch")
+    for e in "${CODES[@]}"; do labels+=("${e%%:*}  ${e#*:}"); done
+
+    _menu "set default startup code  (current: ${cur:-(none)})" "${labels[@]}" || return
+
+    if [[ $REPLY -eq 0 ]]; then
         set_setting default_code ''
     else
-        set_setting default_code "$sel"
+        local entry="${CODES[$(( REPLY - 1 ))]}"
+        set_setting default_code "${entry%%:*}"
     fi
 }
 
 manage_codes() {
+    local actions=('add a code' 'delete a code' 'set default startup code' 'back')
     while true; do
-        local choice
-        choice=$("$DIALOG" --title 'Manage Charge Codes' \
-            --menu 'Choose:' 14 54 4 \
-            add     'Add a charge code' \
-            delete  'Delete a charge code' \
-            default 'Set default startup code' \
-            back    'Back' \
-            3>&1 1>&2 2>&3) || break
-        case "$choice" in
-            add)     do_add_code ;;
-            delete)  do_delete_code ;;
-            default) do_set_default ;;
-            back)    break ;;
+        _menu 'manage codes:' "${actions[@]}" || break
+        case $REPLY in
+            0) do_add_code ;;
+            1) do_delete_code ;;
+            2) do_set_default ;;
+            3) break ;;
         esac
     done
 }
@@ -373,24 +411,10 @@ main() {
         key=''
         IFS= read -r -s -n1 -t1 key 2>/dev/null && {
             case "$key" in
-                q|Q)
-                    break
-                    ;;
-                s|S)
-                    tput cnorm
-                    pick_code
-                    tput civis
-                    ;;
-                m|M)
-                    tput cnorm
-                    manage_codes
-                    tput civis
-                    ;;
-                d|D)
-                    tput cnorm
-                    do_set_default
-                    tput civis
-                    ;;
+                q|Q) break ;;
+                s|S) pick_code ;;
+                m|M) manage_codes ;;
+                d|D) do_set_default ;;
                 [1-9])
                     load_codes
                     local idx=$(( key - 1 ))
